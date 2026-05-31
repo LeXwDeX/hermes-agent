@@ -66,6 +66,7 @@ Usage:
     content = skill_view("axolotl", "references/dataset-formats.md")
 """
 
+import asyncio
 import json
 import logging
 
@@ -1526,6 +1527,178 @@ def skill_view(
 
 
 
+# ---------------------------------------------------------------------------
+# skill_search — unified Skill + Memory retrieval
+# ---------------------------------------------------------------------------
+
+def _parse_query(query: str) -> dict:
+    """Split query into term categories (pure code, no LLM)."""
+    terms = [t.strip().lower() for t in query.split() if len(t.strip()) > 1]
+    _ACTION_WORDS = {
+        "配置", "安装", "使用", "部署", "创建", "修改", "查找", "搜索",
+        "config", "install", "use", "deploy", "create", "modify", "find", "search",
+        "setup", "run", "build", "test", "debug", "fix",
+    }
+    action_terms = [t for t in terms if t in _ACTION_WORDS]
+    non_action = [t for t in terms if t not in _ACTION_WORDS]
+    domain_terms = [t for t in non_action if len(t) >= 3][:5]
+    topic_terms = [t for t in non_action if len(t) >= 2 and t not in domain_terms][:3]
+    return {
+        "domain_terms": domain_terms,
+        "topic_terms": topic_terms,
+        "action_terms": action_terms,
+        "all_terms": terms,
+    }
+
+
+def _find_skill_dir(name: str) -> Optional[Path]:
+    """Return the directory for a skill by resolved name."""
+    from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+
+    dirs_to_scan = []
+    if SKILLS_DIR.exists():
+        dirs_to_scan.append(SKILLS_DIR)
+    dirs_to_scan.extend(get_external_skills_dirs())
+
+    for scan_dir in dirs_to_scan:
+        for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
+            if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
+                continue
+            skill_dir = skill_md.parent
+            try:
+                content = skill_md.read_text(encoding="utf-8")[:1000]
+                frontmatter, _ = _parse_frontmatter(content)
+                if frontmatter.get("name", skill_dir.name) == name:
+                    return skill_dir
+            except Exception:
+                continue
+    return None
+
+
+async def _search_skills_pipeline(terms: dict, limit: int) -> list:
+    """Stage 1 (match) → Stage 2 (rank) → Stage 3 (enrich top 3)."""
+    search_query = " ".join(terms["domain_terms"] + terms["topic_terms"])
+
+    # Stage 1: Match
+    all_skills = _find_all_skills()
+    matches = []
+    for s in all_skills:
+        score, match_on = _match_score(
+            s["name"],
+            s.get("description", ""),
+            s.get("trigger_keywords", []),
+            search_query,
+        )
+        if score > 0:
+            matches.append({**s, "score": score, "match_on": match_on})
+
+    # Stage 2: Rank
+    matches.sort(key=lambda x: x["score"], reverse=True)
+    ranked = matches[:limit]
+
+    # Stage 3: Enrich top 3 with a body preview
+    for skill in ranked[:3]:
+        skill_dir = _find_skill_dir(skill["name"])
+        if not skill_dir:
+            continue
+        skill_md = skill_dir / "SKILL.md"
+        if not skill_md.exists():
+            continue
+        try:
+            text = skill_md.read_text(encoding="utf-8")
+            body_start = text.find("\n---\n", text.find("---", 3) + 3)
+            if body_start > 0:
+                skill["preview"] = text[body_start + 5:body_start + 305].strip()[:200]
+        except Exception:
+            pass
+
+    return ranked
+
+
+def _call_hindsight_recall(query: str, limit: int) -> list:
+    """POST to Hindsight recall API; returns [] on any error."""
+    import urllib.request
+
+    url = "http://192.168.33.110:8888/v1/default/banks/hermes-329433061294866433/recall"
+    body = json.dumps({"query": query, "limit": limit}).encode()
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+            memories = data.get("memories", data.get("results", []))
+            return [
+                {"content": m.get("content", "")[:200], "score": m.get("score", 0)}
+                for m in memories[:limit]
+            ]
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
+def _call_session_search(query: str, limit: int) -> list:
+    """FTS5 search against sessions.db; returns [] when DB absent or on error."""
+    import sqlite3
+
+    db_path = Path(get_hermes_home()) / "sessions" / "sessions.db"
+    if not db_path.exists():
+        return []
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cur = conn.execute(
+            "SELECT session_id, title, substr(content, 1, 200) FROM sessions_fts "
+            "WHERE sessions_fts MATCH ? ORDER BY rank LIMIT ?",
+            (query, limit),
+        )
+        return [{"session_id": r[0], "title": r[1], "snippet": r[2]} for r in cur.fetchall()]
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
+async def _search_memory_pipeline(query: str, limit: int) -> dict:
+    """Run Hindsight + Session searches in parallel (both are blocking I/O)."""
+    hindsight_result, session_result = await asyncio.gather(
+        asyncio.to_thread(_call_hindsight_recall, query, limit),
+        asyncio.to_thread(_call_session_search, query, limit),
+    )
+    return {"hindsight": hindsight_result, "sessions": session_result}
+
+
+def _merge_results(query: str, skills: list, memories: dict) -> dict:
+    return {
+        "query": query,
+        "skills": {"total": len(skills), "results": skills},
+        "memory": memories,
+        "hint": (
+            "skill_view(name) to load a matched skill. "
+            "hindsight_recall(query) for deep memory search if skill_search results are insufficient."
+        ),
+    }
+
+
+async def _skill_search_async(query: str, limit: int) -> dict:
+    terms = _parse_query(query)
+    skill_results, memory_results = await asyncio.gather(
+        _search_skills_pipeline(terms, limit),
+        _search_memory_pipeline(query, limit),
+    )
+    return _merge_results(query, skill_results, memory_results)
+
+
+def skill_search(query: str, limit: int = 5) -> str:
+    """Unified skill + memory retrieval. Single entry point."""
+    loop = asyncio.new_event_loop()
+    try:
+        result = loop.run_until_complete(_skill_search_async(query, limit))
+    finally:
+        loop.close()
+    return json.dumps(result, ensure_ascii=False)
+
+
 if __name__ == "__main__":
     """Test the skills tool"""
     print("🎯 Skills Tool Test")
@@ -1649,5 +1822,29 @@ registry.register(
     handler=_skill_view_with_bump,
     check_fn=check_skills_requirements,
     emoji="📚",
+)
+
+SKILL_SEARCH_SCHEMA = {
+    "name": "skill_search",
+    "description": "Unified skill + memory retrieval. Searches skill names, descriptions, trigger keywords, Hindsight memory, and session history in parallel. Returns ranked results.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Natural language query"},
+            "limit": {"type": "integer", "description": "Max results (default 5)", "default": 5},
+        },
+        "required": ["query"],
+    },
+}
+
+registry.register(
+    name="skill_search",
+    toolset="skills",
+    schema=SKILL_SEARCH_SCHEMA,
+    handler=lambda args, **kw: skill_search(
+        query=args.get("query", ""),
+        limit=args.get("limit", 5),
+    ),
+    emoji="🔍",
 )
 
