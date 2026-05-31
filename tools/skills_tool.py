@@ -1684,7 +1684,7 @@ async def _skill_search_async(query: str, limit: int) -> dict:
     terms = _parse_query(query)
     skill_results, memory_results = await asyncio.gather(
         _search_skills_pipeline(terms, limit),
-        _search_memory_pipeline(query, limit),
+        _search_memory_pipeline(query, 3),
     )
     return _merge_results(query, skill_results, memory_results)
 
@@ -1705,21 +1705,28 @@ def skill_search(query: str, limit: int = 5) -> str:
 
 def knowledge_recall(query: str, limit: int = 5) -> str:
     """Search declarative knowledge (facts about the environment and systems)."""
-    results = _call_hindsight_recall(query, limit)
-    clean = [r for r in results if not r.get("error")]
-    tags_map: Dict[str, List[str]] = {}
+    hindsight_results = _call_hindsight_recall(query, limit)
+    clean = [r for r in hindsight_results if not r.get("error")]
+    try:
+        session_results = _call_session_search(query, 3)
+    except Exception:
+        session_results = []
     return json.dumps(
         {
             "query": query,
-            "results": [
-                {
-                    "content": r.get("content", ""),
-                    "score": r.get("score", 0),
-                    "tags": tags_map.get(r.get("content", ""), []),
-                }
-                for r in clean
-            ],
-            "total": len(clean),
+            "knowledge": {
+                "total": len(clean),
+                "results": [
+                    {
+                        "content": r.get("content", ""),
+                        "score": r.get("score", 0),
+                    }
+                    for r in clean
+                ],
+            },
+            "memory": {
+                "sessions": session_results,
+            },
         },
         ensure_ascii=False,
     )
@@ -1864,7 +1871,9 @@ SKILL_SEARCH_SCHEMA = {
         "Search available skills (capabilities). A skill is a reusable tool or workflow "
         "that the agent can execute — reading files (xlsx, pdf, docx), deploying services, "
         "building firmware, etc. Use this when you need to know WHETHER you can do something "
-        "and HOW to do it."
+        "and HOW to do it. "
+        "Skill results are bundled with relevant memory (past experiences and facts) "
+        "to provide full context in a single call."
     ),
     "parameters": {
         "type": "object",
@@ -1893,7 +1902,9 @@ KNOWLEDGE_RECALL_SCHEMA = {
         "Search declarative knowledge — facts about servers, configurations, environment "
         "details, and system architecture. This is WHAT you know, not HOW to do something.\n\n"
         "Use when: you need facts about a specific server, endpoint, or configuration.\n"
-        "Not for: how-to procedures (use skill_search) or past experiences (use hindsight_recall/session_search)."
+        "Not for: how-to procedures (use skill_search) or past experiences (use hindsight_recall/session_search).\n\n"
+        "Knowledge results are bundled with relevant session memory "
+        "to provide historical context alongside facts."
     ),
     "parameters": {
         "type": "object",
