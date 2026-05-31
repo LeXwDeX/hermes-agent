@@ -1700,84 +1700,29 @@ def skill_search(query: str, limit: int = 5) -> str:
 
 
 # ---------------------------------------------------------------------------
-# knowledge_search — unified knowledge retrieval with semantic typing
+# knowledge_recall — declarative knowledge retrieval
 # ---------------------------------------------------------------------------
 
-def _build_knowledge_results(query: str, skills: list, memories: dict) -> dict:
-    """Merge skill/memory/session results into a unified ranked list with semantic hints."""
-    results = []
-
-    for s in skills:
-        entry = {
-            "knowledge_type": "skill",
-            "name": s["name"],
-            "description": s.get("description", ""),
-            "score": s["score"],
-            "match_on": s.get("match_on", []),
-            "semantic_hint": (
-                f"这是一项已验证的解决方案。加载后你将获得 {s['name']} 的完整知识"
-                "（已验证工作流、已知陷阱、硬约束、环境事实和错误模式）。"
-            ),
-        }
-        if s.get("preview"):
-            entry["preview"] = s["preview"]
-        results.append(entry)
-
-    for m in memories.get("hindsight", []):
-        if m.get("error"):
-            continue
-        results.append({
-            "knowledge_type": "memory",
-            "content": m.get("content", ""),
-            "score": float(m.get("score", 0)),
-            "semantic_hint": "这是之前记录的配置事实或决策，反映了当时的理由和上下文。",
-        })
-
-    for sess in memories.get("sessions", []):
-        results.append({
-            "knowledge_type": "session",
-            "title": sess.get("title", ""),
-            "snippet": sess.get("snippet", ""),
-            "score": 2.0,
-            "semantic_hint": "这是历史对话记录，展示了问题处理方式和决策过程。",
-        })
-
-    results.sort(key=lambda x: x["score"], reverse=True)
-
-    return {
-        "query": query,
-        "results": results,
-        "hint": (
-            "skill_view(name) 加载技能获取完整知识。"
-            "hindsight_recall(query) 深入搜索记忆。"
-        ),
-    }
-
-
-async def _knowledge_search_async(query: str, limit: int) -> dict:
-    terms = _parse_query(query)
-    skill_results, memory_results = await asyncio.gather(
-        _search_skills_pipeline(terms, limit),
-        _search_memory_pipeline(query, limit),
+def knowledge_recall(query: str, limit: int = 5) -> str:
+    """Search declarative knowledge (facts about the environment and systems)."""
+    results = _call_hindsight_recall(query, limit)
+    clean = [r for r in results if not r.get("error")]
+    tags_map: Dict[str, List[str]] = {}
+    return json.dumps(
+        {
+            "query": query,
+            "results": [
+                {
+                    "content": r.get("content", ""),
+                    "score": r.get("score", 0),
+                    "tags": tags_map.get(r.get("content", ""), []),
+                }
+                for r in clean
+            ],
+            "total": len(clean),
+        },
+        ensure_ascii=False,
     )
-    return _build_knowledge_results(query, skill_results, memory_results)
-
-
-def knowledge_search(query: str, limit: int = 5) -> str:
-    """
-    Search three knowledge sources simultaneously and return a unified ranked list.
-
-    Sources:
-    - skill: Structured executable experience (proven solutions, domain expertise)
-    - memory: Declarative facts (environment config, preferences, past decisions)
-    - session: Conversation history (how problems were solved before)
-    """
-    loop = asyncio.new_event_loop()
-    try:
-        result = loop.run_until_complete(_knowledge_search_async(query, limit))
-    finally:
-        loop.close()
-    return json.dumps(result, ensure_ascii=False)
 
 
 if __name__ == "__main__":
@@ -1915,7 +1860,12 @@ registry.register(
 
 SKILL_SEARCH_SCHEMA = {
     "name": "skill_search",
-    "description": "Unified skill + memory retrieval. Searches skill names, descriptions, trigger keywords, Hindsight memory, and session history in parallel. Returns ranked results.",
+    "description": (
+        "Search available skills (capabilities). A skill is a reusable tool or workflow "
+        "that the agent can execute — reading files (xlsx, pdf, docx), deploying services, "
+        "building firmware, etc. Use this when you need to know WHETHER you can do something "
+        "and HOW to do it."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
@@ -1937,34 +1887,29 @@ registry.register(
     emoji="🔍",
 )
 
-KNOWLEDGE_SEARCH_SCHEMA = {
-    "name": "knowledge_search",
+KNOWLEDGE_RECALL_SCHEMA = {
+    "name": "knowledge_recall",
     "description": (
-        "Search three knowledge sources: skills (proven solutions — load with skill_view for "
-        "domain expertise), memory (declarative facts — environment, preferences, past decisions), "
-        "and sessions (conversation history — how problems were solved before).\n\n"
-        "A skill is NOT just matching text — it represents crystallized, battle-tested experience "
-        "created by solving real problems. Finding a matching skill means someone has already solved "
-        "this problem and encoded the solution. Skills are the system's procedural memory (Thin Memory, "
-        "Fat Skills principle).\n\n"
-        "When to use: before any significant action — check if prior knowledge exists.\n"
-        "When NOT needed: simple queries with no knowledge dependency."
+        "Search declarative knowledge — facts about servers, configurations, environment "
+        "details, and system architecture. This is WHAT you know, not HOW to do something.\n\n"
+        "Use when: you need facts about a specific server, endpoint, or configuration.\n"
+        "Not for: how-to procedures (use skill_search) or past experiences (use hindsight_recall/session_search)."
     ),
     "parameters": {
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "Natural language query"},
-            "limit": {"type": "integer", "description": "Max results per source (default 5)", "default": 5},
+            "query": {"type": "string", "description": "Natural language query about facts or configurations"},
+            "limit": {"type": "integer", "description": "Max results (default 5)", "default": 5},
         },
         "required": ["query"],
     },
 }
 
 registry.register(
-    name="knowledge_search",
+    name="knowledge_recall",
     toolset="skills",
-    schema=KNOWLEDGE_SEARCH_SCHEMA,
-    handler=lambda args, **kw: knowledge_search(
+    schema=KNOWLEDGE_RECALL_SCHEMA,
+    handler=lambda args, **kw: knowledge_recall(
         query=args.get("query", ""),
         limit=args.get("limit", 5),
     ),
