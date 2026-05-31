@@ -605,11 +605,16 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
 
                 category = _get_category_from_path(skill_md)
 
+                keywords = frontmatter.get("trigger_keywords", [])
+                if isinstance(keywords, str):
+                    keywords = [keywords]
+
                 seen_names.add(name)
                 skills.append({
                     "name": name,
                     "description": description,
                     "category": category,
+                    "trigger_keywords": keywords,
                 })
 
             except (UnicodeDecodeError, PermissionError) as e:
@@ -627,6 +632,46 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
 def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Keep every skill listing path ordered the same way."""
     return sorted(skills, key=lambda s: (s.get("category") or "", s["name"]))
+
+
+def _match_score(
+    skill_name: str,
+    description: str,
+    trigger_keywords: list,
+    query: str,
+) -> tuple:
+    """Return (score, match_on) for a skill against a query string."""
+    query_terms = query.lower().split()
+    score = 0.0
+    match_on = []
+
+    name_matched = False
+    for term in query_terms:
+        if term in skill_name.lower():
+            score += 5.0
+            if not name_matched:
+                match_on.append("name")
+                name_matched = True
+
+    desc_matched = False
+    for term in query_terms:
+        if term in description.lower():
+            score += 2.0
+            if not desc_matched:
+                match_on.append("description")
+                desc_matched = True
+
+    kw_matched = False
+    for term in query_terms:
+        for kw in (trigger_keywords or []):
+            if term in kw.lower():
+                score += 3.0
+                if not kw_matched:
+                    match_on.append("trigger_keywords")
+                    kw_matched = True
+                break
+
+    return score, match_on
 
 
 def _load_category_description(category_dir: Path) -> Optional[str]:
@@ -672,19 +717,21 @@ def _load_category_description(category_dir: Path) -> Optional[str]:
         return None
 
 
-def skills_list(category: str = None, task_id: str = None) -> str:
+def skills_list(query: str = None, category: str = None, limit: int = 10, task_id: str = None) -> str:
     """
-    List all available skills (progressive disclosure tier 1 - minimal metadata).
-
-    Returns only name + description to minimize token usage. Use skill_view() to
-    load full content, tags, related files, etc.
+    List available skills, with optional keyword search.
 
     Args:
-        category: Optional category filter (e.g., "mlops")
-        task_id: Optional task identifier used to probe the active backend
+        query: Keyword query for semantic search. When provided, returns ranked
+               matches instead of the full list.
+        category: Optional category filter (only applied in full-list mode when
+                  query is None).
+        limit: Max results to return when query is provided (default 10).
+        task_id: Optional task identifier used to probe the active backend.
 
     Returns:
-        JSON string with minimal skill info: name, description, category
+        JSON string. When query is None: full list with name/description/category.
+        When query is set: ranked results with score and match_on fields.
     """
     try:
         if not SKILLS_DIR.exists():
@@ -699,7 +746,6 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                 ensure_ascii=False,
             )
 
-        # Find all skills
         all_skills = _find_all_skills()
 
         if not all_skills:
@@ -713,24 +759,63 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                 ensure_ascii=False,
             )
 
-        # Filter by category if specified
+        # ── Keyword search mode ──────────────────────────────────────────────
+        if query:
+            q = query.strip()
+            scored = []
+            for s in all_skills:
+                score, match_on = _match_score(
+                    s["name"],
+                    s.get("description", ""),
+                    s.get("trigger_keywords", []),
+                    q,
+                )
+                if score > 0:
+                    scored.append({
+                        "name": s["name"],
+                        "description": s.get("description", ""),
+                        "score": score,
+                        "match_on": match_on,
+                    })
+
+            scored.sort(key=lambda x: x["score"], reverse=True)
+            results = scored[:limit]
+
+            return json.dumps(
+                {
+                    "query": q,
+                    "total_matches": len(scored),
+                    "results": results,
+                    "hint": (
+                        "Use skill_view(name) to load a skill. "
+                        "If no skill matches, the query may need different keywords."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+
+        # ── Full-list mode (query=None, backward-compatible) ─────────────────
         if category:
             all_skills = [s for s in all_skills if s.get("category") == category]
 
-        # Sort by category then name
         all_skills = _sort_skills(all_skills)
 
-        # Extract unique categories
         categories = sorted(
             {s.get("category") for s in all_skills if s.get("category")}
         )
 
+        # Strip internal-only field before returning to callers
+        output_skills = [
+            {"name": s["name"], "description": s["description"], "category": s.get("category")}
+            for s in all_skills
+        ]
+
         return json.dumps(
             {
                 "success": True,
-                "skills": all_skills,
+                "skills": output_skills,
                 "categories": categories,
-                "count": len(all_skills),
+                "count": len(output_skills),
                 "hint": "Use skill_view(name) to see full content, tags, and linked files",
             },
             ensure_ascii=False,
