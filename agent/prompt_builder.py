@@ -287,8 +287,6 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
 # Add new patterns here when a model family needs explicit steering.
 TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "glm", "qwen", "deepseek")
 
-<<<<<<< HEAD
-=======
 # Universal "finish the job" guidance — applied to ALL models, not gated
 # by model family.  Addresses two cross-model failure modes:
 #   1. Stopping after a stub: writing a tiny file or running one command

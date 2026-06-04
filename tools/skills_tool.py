@@ -80,6 +80,7 @@ from typing import Dict, Any, List, Optional, Set, Tuple
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get
 from utils import env_var_enabled
+from agent.skill_utils import EXCLUDED_SKILL_DIRS as _EXCLUDED_SKILL_DIRS
 
 logger = logging.getLogger(__name__)
 
@@ -102,9 +103,8 @@ _PLATFORM_MAP = {
     "windows": "win32",
 }
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_EXCLUDED_SKILL_DIRS = frozenset((".git", ".github", ".hub", ".archive"))
 _REMOTE_ENV_BACKENDS = frozenset(
-    {"docker", "singularity", "modal", "ssh", "daytona", "vercel_sandbox"}
+    {"docker", "singularity", "modal", "ssh", "daytona"}
 )
 _secret_capture_callback = None
 
@@ -306,7 +306,13 @@ def _capture_required_environment_variables(
         }
 
     missing_names = [entry["name"] for entry in missing_entries]
-    if _is_gateway_surface():
+    # Most gateway surfaces (messaging platforms) can't prompt for a secret, so
+    # they short-circuit to the "unsupported" hint. Interactive gateway surfaces
+    # — the desktop app / TUI — set HERMES_INTERACTIVE and register a
+    # secret-capture callback that routes to a secure secret.request overlay, so
+    # they fall through and actually prompt. (HERMES_INTERACTIVE is the same flag
+    # tools/approval.py uses to tell an interactive surface from a messaging one.)
+    if _is_gateway_surface() and not env_var_enabled("HERMES_INTERACTIVE"):
         return {
             "missing_names": missing_names,
             "setup_skipped": False,
@@ -635,90 +641,7 @@ def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(skills, key=lambda s: (s.get("category") or "", s["name"]))
 
 
-def _match_score(
-    skill_name: str,
-    description: str,
-    trigger_keywords: list,
-    query: str,
-) -> tuple:
-    """Return (score, match_on) for a skill against a query string."""
-    query_terms = query.lower().split()
-    score = 0.0
-    match_on = []
-
-    name_matched = False
-    for term in query_terms:
-        if term in skill_name.lower():
-            score += 5.0
-            if not name_matched:
-                match_on.append("name")
-                name_matched = True
-
-    desc_matched = False
-    for term in query_terms:
-        if term in description.lower():
-            score += 2.0
-            if not desc_matched:
-                match_on.append("description")
-                desc_matched = True
-
-    kw_matched = False
-    for term in query_terms:
-        for kw in (trigger_keywords or []):
-            if term in kw.lower():
-                score += 3.0
-                if not kw_matched:
-                    match_on.append("trigger_keywords")
-                    kw_matched = True
-                break
-
-    return score, match_on
-
-
-def _load_category_description(category_dir: Path) -> Optional[str]:
-    """
-    Load category description from DESCRIPTION.md if it exists.
-
-    Args:
-        category_dir: Path to the category directory
-
-    Returns:
-        Description string or None if not found
-    """
-    desc_file = category_dir / "DESCRIPTION.md"
-    if not desc_file.exists():
-        return None
-
-    try:
-        content = desc_file.read_text(encoding="utf-8")
-        # Parse frontmatter if present
-        frontmatter, body = _parse_frontmatter(content)
-
-        # Prefer frontmatter description, fall back to first non-header line
-        description = frontmatter.get("description", "")
-        if not description:
-            for line in body.strip().split("\n"):
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    description = line
-                    break
-
-        # Truncate to reasonable length
-        if len(description) > MAX_DESCRIPTION_LENGTH:
-            description = description[: MAX_DESCRIPTION_LENGTH - 3] + "..."
-
-        return description if description else None
-    except (UnicodeDecodeError, PermissionError) as e:
-        logger.debug("Failed to read category description %s: %s", desc_file, e)
-        return None
-    except Exception as e:
-        logger.warning(
-            "Error parsing category description %s: %s", desc_file, e, exc_info=True
-        )
-        return None
-
-
-def skills_list(query: str = None, category: str = None, limit: int = 10, task_id: str = None) -> str:
+def skills_list(category: str = None, task_id: str = None) -> str:
     """
     List available skills, with optional keyword search.
 
@@ -1864,66 +1787,3 @@ registry.register(
     check_fn=check_skills_requirements,
     emoji="📚",
 )
-
-SKILL_SEARCH_SCHEMA = {
-    "name": "skill_search",
-    "description": (
-        "Search available skills (capabilities). A skill is a reusable tool or workflow "
-        "that the agent can execute — reading files (xlsx, pdf, docx), deploying services, "
-        "building firmware, etc. Use this when you need to know WHETHER you can do something "
-        "and HOW to do it. "
-        "Skill results are bundled with relevant memory (past experiences and facts) "
-        "to provide full context in a single call."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "Natural language query"},
-            "limit": {"type": "integer", "description": "Max results (default 5)", "default": 5},
-        },
-        "required": ["query"],
-    },
-}
-
-registry.register(
-    name="skill_search",
-    toolset="skills",
-    schema=SKILL_SEARCH_SCHEMA,
-    handler=lambda args, **kw: skill_search(
-        query=args.get("query", ""),
-        limit=args.get("limit", 5),
-    ),
-    emoji="🔍",
-)
-
-KNOWLEDGE_RECALL_SCHEMA = {
-    "name": "knowledge_recall",
-    "description": (
-        "Search declarative knowledge — facts about servers, configurations, environment "
-        "details, and system architecture. This is WHAT you know, not HOW to do something.\n\n"
-        "Use when: you need facts about a specific server, endpoint, or configuration.\n"
-        "Not for: how-to procedures (use skill_search) or past experiences (use hindsight_recall/session_search).\n\n"
-        "Knowledge results are bundled with relevant session memory "
-        "to provide historical context alongside facts."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "Natural language query about facts or configurations"},
-            "limit": {"type": "integer", "description": "Max results (default 5)", "default": 5},
-        },
-        "required": ["query"],
-    },
-}
-
-registry.register(
-    name="knowledge_recall",
-    toolset="skills",
-    schema=KNOWLEDGE_RECALL_SCHEMA,
-    handler=lambda args, **kw: knowledge_recall(
-        query=args.get("query", ""),
-        limit=args.get("limit", 5),
-    ),
-    emoji="🧠",
-)
-

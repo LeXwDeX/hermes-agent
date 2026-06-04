@@ -70,7 +70,8 @@ def test_board_empty(client):
     data = r.json()
     # All canonical columns present (triage + the rest), each empty.
     names = [c["name"] for c in data["columns"]]
-    for expected in ("triage", "todo", "ready", "running", "blocked", "done"):
+    assert set(names) == kb.VALID_STATUSES - {"archived"}
+    for expected in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
         assert expected in names, f"missing column {expected}: {names}"
     assert all(len(c["tasks"]) == 0 for c in data["columns"])
     assert data["tenants"] == []
@@ -111,6 +112,31 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+
+def test_scheduled_tasks_have_their_own_column_not_todo(client):
+    """Scheduled/time-delay tasks must not be silently bucketed into todo."""
+
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "wait for indexed data", "assignee": "ops"},
+    ).json()["task"]
+
+    conn = kb.connect()
+    try:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status = 'scheduled' WHERE id = ?",
+                (task["id"],),
+            )
+    finally:
+        conn.close()
+
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200
+    columns = {c["name"]: c["tasks"] for c in r.json()["columns"]}
+    assert any(t["id"] == task["id"] for t in columns["scheduled"])
+    assert not any(t["id"] == task["id"] for t in columns["todo"])
 
 
 def test_tenant_filter(client):
@@ -295,6 +321,28 @@ def test_patch_block_then_unblock(client):
     assert r.json()["task"]["status"] == "ready"
 
 
+def test_patch_schedule_then_unblock(client):
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{t['id']}",
+        json={"status": "scheduled", "block_reason": "run tomorrow"},
+    )
+    assert r.status_code == 200
+    assert r.json()["task"]["status"] == "scheduled"
+
+    columns = client.get("/api/plugins/kanban/board").json()["columns"]
+    assert "scheduled" in [c["name"] for c in columns]
+    scheduled = next(c for c in columns if c["name"] == "scheduled")
+    assert any(x["id"] == t["id"] for x in scheduled["tasks"])
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{t['id']}",
+        json={"status": "ready"},
+    )
+    assert r.status_code == 200
+    assert r.json()["task"]["status"] == "ready"
+
+
 def test_patch_drag_drop_move_todo_to_ready(client):
     """Direct status write: the drag-drop path for statuses without a
     dedicated verb (e.g. manually promoting todo -> ready).
@@ -314,6 +362,18 @@ def test_patch_drag_drop_move_todo_to_ready(client):
         json={"status": "ready"},
     )
     assert r.status_code == 409
+
+    # The 409 detail must name the blocking parent so the dashboard can
+    # render an actionable toast instead of a silent no-op (#26744).
+    detail = r.json()["detail"]
+    assert "Cannot move to 'ready'" in detail
+    assert parent["id"] in detail
+    assert "'p'" in detail
+    assert "status=" in detail
+    # Whatever non-``done`` status the parent currently has must show up
+    # so the operator knows what to fix.
+    assert f"status={parent['status']}" in detail
+    assert parent["status"] != "done"
 
     # Complete the parent.
     r = client.patch(
@@ -423,6 +483,33 @@ def test_patch_status_running_rejected(client):
         for tt in col["tasks"]
     }
     assert statuses.get(t["id"]) != "running"
+
+
+# ---------------------------------------------------------------------------
+# DELETE /tasks/:id
+# ---------------------------------------------------------------------------
+
+def test_delete_task(client):
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "to-delete"}).json()["task"]
+    r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
+    assert r.status_code == 200
+    assert r.json()["deleted"] is True
+    assert r.json()["task_id"] == t["id"]
+
+    # Gone from board
+    board = client.get("/api/plugins/kanban/board").json()
+    all_ids = [tt["id"] for col in board["columns"] for tt in col["tasks"]]
+    assert t["id"] not in all_ids
+
+    # Gone from detail
+    r = client.get(f"/api/plugins/kanban/tasks/{t['id']}")
+    assert r.status_code == 404
+
+
+def test_delete_task_not_found(client):
+    r = client.delete("/api/plugins/kanban/tasks/t_nonexistent")
+    assert r.status_code == 404
+    assert "not found" in r.json()["detail"]
 
 
 # ---------------------------------------------------------------------------
@@ -648,18 +735,29 @@ def test_board_auto_initializes_missing_db(tmp_path, monkeypatch):
 
 
 def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch):
-    """When _SESSION_TOKEN is set (normal dashboard context), a missing or
-    wrong ?token= query param must be rejected with policy-violation."""
+    """Loopback mode: a missing or wrong ?token= must be rejected with
+    policy-violation; the correct token is accepted. The kanban WS now
+    delegates to web_server._ws_auth_ok, so we stub that with the real
+    loopback-token semantics (auth_required False → constant-time token
+    compare)."""
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
 
-    # Stub web_server so _check_ws_token has a token to compare against.
+    # Stub web_server with a loopback-mode _ws_auth_ok (auth_required False →
+    # accept only the correct ?token=). Mirrors the real gate's loopback path.
     import hermes_cli
     import types
-    stub = types.SimpleNamespace(_SESSION_TOKEN="secret-xyz")
+
+    def _fake_ws_auth_ok(ws):
+        return ws.query_params.get("token", "") == "secret-xyz"
+
+    stub = types.SimpleNamespace(
+        _SESSION_TOKEN="secret-xyz",
+        _ws_auth_ok=_fake_ws_auth_ok,
+    )
     monkeypatch.setitem(sys.modules, "hermes_cli.web_server", stub)
     monkeypatch.setattr(hermes_cli, "web_server", stub, raising=False)
 
@@ -685,6 +783,51 @@ def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch):
         "/api/plugins/kanban/events?token=secret-xyz"
     ) as ws:
         assert ws is not None  # handshake succeeded
+
+
+def test_ws_events_accepts_gated_ticket(tmp_path, monkeypatch):
+    """Gated OAuth mode: the WS must accept a single-use ?ticket= (and reject
+    a bare ?token=, even one matching _SESSION_TOKEN). This is the regression
+    for the hosted-dashboard bug where the kanban live-events WS 1008'd on
+    every gated deployment because its bespoke check only knew _SESSION_TOKEN.
+    We stub _ws_auth_ok with the real gated semantics (ticket-only)."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+
+    import hermes_cli
+    import types
+
+    def _fake_ws_auth_ok(ws):
+        # Gated mode: only a known ticket is accepted; token path rejected.
+        return ws.query_params.get("ticket", "") == "good-ticket"
+
+    stub = types.SimpleNamespace(
+        _SESSION_TOKEN="secret-xyz",
+        _ws_auth_ok=_fake_ws_auth_ok,
+    )
+    monkeypatch.setitem(sys.modules, "hermes_cli.web_server", stub)
+    monkeypatch.setattr(hermes_cli, "web_server", stub, raising=False)
+
+    app = FastAPI()
+    app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
+    c = TestClient(app)
+
+    from starlette.websockets import WebSocketDisconnect
+
+    # Legacy token is rejected in gated mode, even if it's the real one.
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with c.websocket_connect("/api/plugins/kanban/events?token=secret-xyz"):
+            pass
+    assert exc.value.code == 1008
+
+    # A valid ticket is accepted.
+    with c.websocket_connect(
+        "/api/plugins/kanban/events?ticket=good-ticket"
+    ) as ws:
+        assert ws is not None
 
 
 def test_ws_events_board_query_param_default_overrides_current_board_pointer(tmp_path, monkeypatch):
@@ -719,7 +862,10 @@ def test_ws_events_board_query_param_default_overrides_current_board_pointer(tmp
     import hermes_cli
     import types
 
-    stub = types.SimpleNamespace(_SESSION_TOKEN="secret-xyz")
+    stub = types.SimpleNamespace(
+        _SESSION_TOKEN="secret-xyz",
+        _ws_auth_ok=lambda ws: ws.query_params.get("token", "") == "secret-xyz",
+    )
     monkeypatch.setitem(sys.modules, "hermes_cli.web_server", stub)
     monkeypatch.setattr(hermes_cli, "web_server", stub, raising=False)
 
@@ -748,8 +894,6 @@ def test_ws_events_swallows_cancellation_on_shutdown(tmp_path, monkeypatch):
     the cancellation outcome deterministically.
     """
     import asyncio
-    import types
-    import sys as _sys
 
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -757,10 +901,10 @@ def test_ws_events_swallows_cancellation_on_shutdown(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
 
-    # Short-circuit the token check — this test is about the cancellation
+    # Short-circuit the auth check — this test is about the cancellation
     # path, not auth.
     import plugins.kanban.dashboard.plugin_api as pa
-    monkeypatch.setattr(pa, "_check_ws_token", lambda t: True)
+    monkeypatch.setattr(pa, "_ws_upgrade_authorized", lambda ws: True)
 
     class _FakeWS:
         def __init__(self):
@@ -854,6 +998,31 @@ def test_bulk_status_done_forwards_completion_summary(client):
         conn.close()
 
 
+def test_bulk_status_running_rejected(client):
+    """Bulk updates must match single-task PATCH: direct 'running' is invalid."""
+    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [t["id"]], "status": "running"},
+    )
+
+    assert r.status_code == 200
+    results = r.json()["results"]
+    assert len(results) == 1
+    assert results[0]["id"] == t["id"]
+    assert results[0]["ok"] is False
+    assert "running" in results[0]["error"]
+
+    board = client.get("/api/plugins/kanban/board").json()
+    statuses = {
+        tt["id"]: col["name"]
+        for col in board["columns"]
+        for tt in col["tasks"]
+    }
+    assert statuses.get(t["id"]) != "running"
+
+
 def test_dashboard_done_actions_prompt_for_completion_summary():
     repo_root = Path(__file__).resolve().parents[2]
     bundle = (
@@ -865,6 +1034,34 @@ def test_dashboard_done_actions_prompt_for_completion_summary():
     assert "result: summary" in bundle
     assert "body: JSON.stringify(patch)" in bundle
     assert "body: JSON.stringify(finalPatch)" in bundle
+
+
+def test_dashboard_surfaces_ready_blocked_error_inline():
+    """Regression for #26744: failed status transitions must be surfaced
+    inline, not swallowed.  The drag/drop banner and the drawer's action
+    row each render the parsed API ``detail`` so operators see *why*
+    their click did nothing.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    bundle = (
+        repo_root / "plugins" / "kanban" / "dashboard" / "dist" / "index.js"
+    ).read_text()
+
+    # Helper that strips ``"409: {\"detail\":\"…\"}"`` down to the
+    # human-readable message before it lands in any banner.
+    assert "function parseApiErrorMessage(err)" in bundle
+    assert "parsed.detail" in bundle
+
+    # Drag/drop banner now uses the parsed message instead of raw
+    # ``err.message`` so it no longer leaks HTTP plumbing.
+    assert "setError(tx(t, \"moveFailed\", \"Move failed: \") + parseApiErrorMessage(err))" in bundle
+
+    # Drawer action row has its own visible error surface and clears it
+    # on success/refresh so stale failures don't follow the operator
+    # around.
+    assert "const [patchErr, setPatchErr] = useState(null);" in bundle
+    assert "setPatchErr(parseApiErrorMessage(e))" in bundle
+    assert "setPatchErr(null)" in bundle
 
 
 def test_dashboard_dependency_selects_use_value_change_handler():
@@ -1799,7 +1996,8 @@ def test_diagnostics_endpoint_surfaces_blocked_hallucination(client):
 
 
 def test_diagnostics_endpoint_severity_filter(client):
-    """Warning-severity filter excludes error-severity entries."""
+    """Severity filter is at-or-above: warning includes warning+error+critical,
+    error includes error+critical, critical is exact (no higher level)."""
     conn = kb.connect()
     try:
         # A warning-severity diagnostic (prose phantom) on one task.
@@ -1807,22 +2005,26 @@ def test_diagnostics_endpoint_severity_filter(client):
         # requires ``t_[a-f0-9]{8,}``.
         p1 = kb.create_task(conn, title="prose", assignee="a")
         kb.complete_task(conn, p1, summary="mentioned t_deadbeef1234")
-        # An error-severity diagnostic (spawn failures) on another
+        # An error-severity diagnostic (spawn failures) on another.
+        # Keep this below critical severity (failure_threshold * 2).
         p2 = kb.create_task(conn, title="spawn", assignee="b")
         conn.execute(
-            "UPDATE tasks SET consecutive_failures=5, last_failure_error='x' WHERE id=?",
+            "UPDATE tasks SET consecutive_failures=2, last_failure_error='x' WHERE id=?",
             (p2,),
         )
         conn.commit()
     finally:
         conn.close()
 
+    # warning filter is at-or-above → both the warning AND the error pass.
     r = client.get("/api/plugins/kanban/diagnostics?severity=warning")
     assert r.status_code == 200
     data = r.json()
-    assert data["count"] == 1
-    assert data["diagnostics"][0]["task_id"] == p1
+    assert data["count"] == 2
+    task_ids = {row["task_id"] for row in data["diagnostics"]}
+    assert task_ids == {p1, p2}
 
+    # error filter is at-or-above → only the error passes (warning is below).
     r = client.get("/api/plugins/kanban/diagnostics?severity=error")
     data = r.json()
     assert data["count"] == 1
