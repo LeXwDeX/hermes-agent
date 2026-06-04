@@ -97,10 +97,13 @@ return:
     "fanout": false,
     "rationale": "<one sentence>",
     "title": "<tightened title>",
-    "body":  "<concrete spec for a single worker>"
+    "body":  "<concrete spec for a single worker>",
+    "assignee": "<profile name from the roster, or null for default>"
   }
 
-In that case the task stays as one work item, just with a tightened spec.
+In that case the task stays as one work item, just with a tightened spec and
+a concrete assignee. If no profile fits, use null and the system will route to
+the default_assignee.
 
 No preamble, no closing remarks, no code fences. Output only the JSON object.
 """
@@ -246,6 +249,25 @@ def _format_roster(roster: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _normalize_assignee_choice(
+    assignee: object,
+    *,
+    default_assignee: str,
+    valid_names: set[str],
+) -> str:
+    """Return a valid assignee, falling back to ``default_assignee``.
+
+    Fan-out children and the single-task fallback should share the same
+    routing guarantee: promoted work must not be left unassigned.
+    """
+    if not isinstance(assignee, str) or not assignee.strip():
+        return default_assignee
+    chosen = assignee.strip()
+    if chosen not in valid_names:
+        return default_assignee
+    return chosen
+
+
 def decompose_task(
     task_id: str,
     *,
@@ -259,7 +281,7 @@ def decompose_task(
     configured, API error, malformed response, decomposer returned
     fanout=true with empty task list) — those surface via ``ok=False``.
     """
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, "unknown task id")
@@ -337,16 +359,24 @@ def decompose_task(
         new_body = parsed.get("body")
         title_val = new_title.strip() if isinstance(new_title, str) and new_title.strip() else None
         body_val = new_body if isinstance(new_body, str) and new_body.strip() else None
+        assignee_val = None
+        if not task.assignee:
+            assignee_val = _normalize_assignee_choice(
+                parsed.get("assignee"),
+                default_assignee=default_assignee,
+                valid_names=valid_names,
+            )
         if title_val is None and body_val is None:
             return DecomposeOutcome(
                 task_id, False, "decomposer returned fanout=false with no title/body",
             )
-        with kb.connect() as conn:
+        with kb.connect_closing() as conn:
             ok = kb.specify_triage_task(
                 conn,
                 task_id,
                 title=title_val,
                 body=body_val,
+                assignee=assignee_val,
                 author=audit_author,
             )
         if not ok:
@@ -381,17 +411,21 @@ def decompose_task(
         if not isinstance(body, str):
             body = ""
         assignee = entry.get("assignee")
-        if not isinstance(assignee, str) or not assignee.strip():
-            chosen = default_assignee
-        elif assignee not in valid_names:
+        chosen = _normalize_assignee_choice(
+            assignee,
+            default_assignee=default_assignee,
+            valid_names=valid_names,
+        )
+        if (
+            isinstance(assignee, str)
+            and assignee.strip()
+            and assignee.strip() not in valid_names
+        ):
             logger.info(
                 "decompose: task %s child %d picked unknown assignee %r — "
                 "routing to default_assignee %r",
                 task_id, idx, assignee, default_assignee,
             )
-            chosen = default_assignee
-        else:
-            chosen = assignee
         parents = entry.get("parents") or []
         if not isinstance(parents, list):
             parents = []
@@ -405,7 +439,7 @@ def decompose_task(
         })
 
     try:
-        with kb.connect() as conn:
+        with kb.connect_closing() as conn:
             child_ids = kb.decompose_triage_task(
                 conn,
                 task_id,
@@ -433,7 +467,7 @@ def decompose_task(
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     """Return task ids currently in the triage column."""
-    with kb.connect() as conn:
+    with kb.connect_closing() as conn:
         rows = kb.list_tasks(
             conn,
             status="triage",

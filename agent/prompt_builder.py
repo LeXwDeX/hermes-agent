@@ -10,7 +10,6 @@ assemble pieces, then combines them with memory and ephemeral prompts.
 import json
 import logging
 import os
-import re
 import threading
 from collections import OrderedDict
 from pathlib import Path
@@ -18,6 +17,7 @@ from pathlib import Path
 from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
 from typing import Optional
 
+from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
     extract_skill_conditions,
     extract_skill_description,
@@ -32,43 +32,30 @@ from utils import atomic_json_write
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Context file scanning — detect prompt injection in AGENTS.md, .cursorrules,
-# SOUL.md before they get injected into the system prompt.
+# Context file scanning — detect prompt injection / promptware in AGENTS.md,
+# .cursorrules, SOUL.md before they get injected into the system prompt.
+#
+# Patterns live in ``tools/threat_patterns.py`` — the single source of truth
+# shared with the memory-tool scanner and the tool-result delimiter system.
+# This module just chooses how to react when a match is found (block-with-
+# placeholder; the actual content never reaches the system prompt).
 # ---------------------------------------------------------------------------
 
-_CONTEXT_THREAT_PATTERNS = [
-    (r'ignore\s+(previous|all|above|prior)\s+instructions', "prompt_injection"),
-    (r'do\s+not\s+tell\s+the\s+user', "deception_hide"),
-    (r'system\s+prompt\s+override', "sys_prompt_override"),
-    (r'disregard\s+(your|all|any)\s+(instructions|rules|guidelines)', "disregard_rules"),
-    (r'act\s+as\s+(if|though)\s+you\s+(have\s+no|don\'t\s+have)\s+(restrictions|limits|rules)', "bypass_restrictions"),
-    (r'<!--[^>]*(?:ignore|override|system|secret|hidden)[^>]*-->', "html_comment_injection"),
-    (r'<\s*div\s+style\s*=\s*["\'][\s\S]*?display\s*:\s*none', "hidden_div"),
-    (r'translate\s+.*\s+into\s+.*\s+and\s+(execute|run|eval)', "translate_execute"),
-    (r'curl\s+[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)', "exfil_curl"),
-    (r'cat\s+[^\n]*(\.env|credentials|\.netrc|\.pgpass)', "read_secrets"),
-]
-
-_CONTEXT_INVISIBLE_CHARS = {
-    '\u200b', '\u200c', '\u200d', '\u2060', '\ufeff',
-    '\u202a', '\u202b', '\u202c', '\u202d', '\u202e',
-}
+from tools.threat_patterns import scan_for_threats as _scan_for_threats
 
 
 def _scan_context_content(content: str, filename: str) -> str:
-    """Scan context file content for injection. Returns sanitized content."""
-    findings = []
+    """Scan context file content for injection. Returns sanitized content.
 
-    # Check invisible unicode
-    for char in _CONTEXT_INVISIBLE_CHARS:
-        if char in content:
-            findings.append(f"invisible unicode U+{ord(char):04X}")
-
-    # Check threat patterns
-    for pattern, pid in _CONTEXT_THREAT_PATTERNS:
-        if re.search(pattern, content, re.IGNORECASE):
-            findings.append(pid)
-
+    Uses the "context" scope from the shared threat-pattern library, which
+    covers classic injection + promptware/C2 patterns + role-play hijack.
+    Strict-scope patterns (SSH backdoor, persistence, exfil-URL) are NOT
+    applied here — those are too aggressive for a context file in a
+    cloned repo (security research, infra docs).  Content matching is
+    BLOCKED at this layer because the file would otherwise enter the
+    system prompt verbatim and the user has no chance to intervene.
+    """
+    findings = _scan_for_threats(content, scope="context")
     if findings:
         logger.warning("Context file %s blocked: %s", filename, ", ".join(findings))
         return f"[BLOCKED: {filename} contained potential prompt injection ({', '.join(findings)}). Content not loaded.]"
@@ -145,9 +132,14 @@ DEFAULT_AGENT_IDENTITY = (
 )
 
 HERMES_AGENT_HELP_GUIDANCE = (
-    "If the user asks about configuring, setting up, or using Hermes Agent "
-    "itself, load the `hermes-agent` skill with skill_view(name='hermes-agent') "
-    "before answering. Docs: https://hermes-agent.nousresearch.com/docs"
+    "You run on Hermes Agent (by Nous Research). When the user needs help with "
+    "Hermes itself — configuring, setting up, using, extending, or troubleshooting "
+    "it — or when you need to understand your own features, tools, or capabilities, "
+    "the documentation at https://hermes-agent.nousresearch.com/docs is your "
+    "authoritative reference and always holds the latest, most up-to-date "
+    "information. Load the `hermes-agent` skill with skill_view(name='hermes-agent') "
+    "for additional guidance and proven workflows, but treat the docs as the source "
+    "of truth when the two differ."
 )
 
 MEMORY_GUIDANCE = (
@@ -221,7 +213,12 @@ KANBAN_GUIDANCE = (
     "files outside it unless the task explicitly asks.\n"
     "3. **Heartbeat on long operations.** Call `kanban_heartbeat(note=...)` "
     "every few minutes during long subprocesses (training, encoding, crawling). "
-    "Skip heartbeats for short tasks.\n"
+    "Skip heartbeats for short tasks. **If your task may run longer than 1 hour, "
+    "you MUST call `kanban_heartbeat` at least once an hour** — the dispatcher "
+    "reclaims tasks running past `kanban.dispatch_stale_timeout_seconds` "
+    "(default 4 hours) when no heartbeat has arrived in the last hour. A "
+    "reclaim re-queues the task as `ready` without penalty (no failure counter "
+    "tick), but you lose your current run's progress.\n"
     "4. **Block on genuine ambiguity.** If you need a human decision you cannot "
     "infer (missing credentials, UX choice, paywalled source, peer output you "
     "need first), call `kanban_block(reason=\"...\")` and stop. Don't guess. "
@@ -259,6 +256,11 @@ KANBAN_GUIDANCE = (
     "- Do not shell out to `hermes kanban <verb>` for board operations. Use "
     "the `kanban_*` tools — they work across all terminal backends.\n"
     "- Do not complete a task you didn't actually finish. Block it.\n"
+    "- Do not call `clarify` to ask questions. You are running headless — "
+    "there is no live user to answer. The call will time out and the task "
+    "will sit silently in `running` with no signal to the operator. Instead: "
+    "`kanban_comment` the context, then `kanban_block(reason=...)` so the "
+    "task surfaces on the board as needing input.\n"
     "- Do not assign follow-up work to yourself. Assign it to the right "
     "specialist profile.\n"
     "- Do not call `delegate_task` as a board substitute. `delegate_task` is "
@@ -285,6 +287,131 @@ TOOL_USE_ENFORCEMENT_GUIDANCE = (
 # Add new patterns here when a model family needs explicit steering.
 TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok", "glm", "qwen", "deepseek")
 
+<<<<<<< HEAD
+=======
+# Universal "finish the job" guidance — applied to ALL models, not gated
+# by model family.  Addresses two cross-model failure modes:
+#   1. Stopping after a stub: writing a tiny file or running one command
+#      and then ending the turn with a description of the plan instead
+#      of the finished artifact.  (Observed on Opus during a real
+#      Sarasota real-estate build task: 3 API calls, 85-byte file,
+#      one terminal command, finish_reason=stop.)
+#   2. Fabricating output when a real path is blocked.  When `pip` or a
+#      tool fails, some models will synthesize plausible-looking results
+#      (fake addresses, fake JSON, fake numbers) instead of reporting
+#      the blocker.  (Observed on DeepSeek v4-flash on the same task:
+#      pushed through PEP-668 wall, then returned fabricated listings.)
+#
+# Short on purpose.  This block is shipped to every user, every session,
+# in the cached system prompt — token cost is paid once at install and
+# then amortised across all sessions via prefix caching.  Keep it tight.
+TASK_COMPLETION_GUIDANCE = (
+    "# Finishing the job\n"
+    "When the user asks you to build, run, or verify something, the deliverable is "
+    "a working artifact backed by real tool output — not a description of one. "
+    "Do not stop after writing a stub, a plan, or a single command. Keep working "
+    "until you have actually exercised the code or produced the requested result, "
+    "then report what real execution returned.\n"
+    "If a tool, install, or network call fails and blocks the real path, say so "
+    "directly and try an alternative (different package manager, different "
+    "approach, ask the user). NEVER substitute plausible-looking fabricated "
+    "output (made-up data, invented file contents, synthesised API responses) "
+    "for results you couldn't actually produce. Reporting a blocker honestly "
+    "is always better than inventing a result."
+)
+
+# OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
+# where GPT models abandon work on partial results, skip prerequisite lookups,
+# hallucinate instead of using tools, and declare "done" without verification.
+# Inspired by patterns from OpenAI's GPT-5.4 prompting guide & OpenClaw PR #38953.
+# Also applied to xAI Grok — same failure modes in practice (claims completion
+# without tool calls, suggests workarounds instead of using existing tools,
+# replies with plans/suggestions instead of executing). The body is
+# family-agnostic; the OPENAI_ prefix reflects origin, not exclusivity.
+OPENAI_MODEL_EXECUTION_GUIDANCE = (
+    "# Execution discipline\n"
+    "<tool_persistence>\n"
+    "- Use tools whenever they improve correctness, completeness, or grounding.\n"
+    "- Do not stop early when another tool call would materially improve the result.\n"
+    "- If a tool returns empty or partial results, retry with a different query or "
+    "strategy before giving up.\n"
+    "- Keep calling tools until: (1) the task is complete, AND (2) you have verified "
+    "the result.\n"
+    "</tool_persistence>\n"
+    "\n"
+    "<mandatory_tool_use>\n"
+    "NEVER answer these from memory or mental computation — ALWAYS use a tool:\n"
+    "- Arithmetic, math, calculations → use terminal or execute_code\n"
+    "- Hashes, encodings, checksums → use terminal (e.g. sha256sum, base64)\n"
+    "- Current time, date, timezone → use terminal (e.g. date)\n"
+    "- System state: OS, CPU, memory, disk, ports, processes → use terminal\n"
+    "- File contents, sizes, line counts → use read_file, search_files, or terminal\n"
+    "- Git history, branches, diffs → use terminal\n"
+    "- Current facts (weather, news, versions) → use web_search\n"
+    "Your memory and user profile describe the USER, not the system you are "
+    "running on. The execution environment may differ from what the user profile "
+    "says about their personal setup.\n"
+    "</mandatory_tool_use>\n"
+    "\n"
+    "<act_dont_ask>\n"
+    "When a question has an obvious default interpretation, act on it immediately "
+    "instead of asking for clarification. Examples:\n"
+    "- 'Is port 443 open?' → check THIS machine (don't ask 'open where?')\n"
+    "- 'What OS am I running?' → check the live system (don't use user profile)\n"
+    "- 'What time is it?' → run `date` (don't guess)\n"
+    "Only ask for clarification when the ambiguity genuinely changes what tool "
+    "you would call.\n"
+    "</act_dont_ask>\n"
+    "\n"
+    "<prerequisite_checks>\n"
+    "- Before taking an action, check whether prerequisite discovery, lookup, or "
+    "context-gathering steps are needed.\n"
+    "- Do not skip prerequisite steps just because the final action seems obvious.\n"
+    "- If a task depends on output from a prior step, resolve that dependency first.\n"
+    "</prerequisite_checks>\n"
+    "\n"
+    "<verification>\n"
+    "Before finalizing your response:\n"
+    "- Correctness: does the output satisfy every stated requirement?\n"
+    "- Grounding: are factual claims backed by tool outputs or provided context?\n"
+    "- Formatting: does the output match the requested format or schema?\n"
+    "- Safety: if the next step has side effects (file writes, commands, API calls), "
+    "confirm scope before executing.\n"
+    "</verification>\n"
+    "\n"
+    "<missing_context>\n"
+    "- If required context is missing, do NOT guess or hallucinate an answer.\n"
+    "- Use the appropriate lookup tool when missing information is retrievable "
+    "(search_files, web_search, read_file, etc.).\n"
+    "- Ask a clarifying question only when the information cannot be retrieved by tools.\n"
+    "- If you must proceed with incomplete information, label assumptions explicitly.\n"
+    "</missing_context>"
+)
+
+# Gemini/Gemma-specific operational guidance, adapted from OpenCode's gemini.txt.
+# Injected alongside TOOL_USE_ENFORCEMENT_GUIDANCE when the model is Gemini or Gemma.
+GOOGLE_MODEL_OPERATIONAL_GUIDANCE = (
+    "# Google model operational directives\n"
+    "Follow these operational rules strictly:\n"
+    "- **Absolute paths:** Always construct and use absolute file paths for all "
+    "file system operations. Combine the project root with relative paths.\n"
+    "- **Verify first:** Use read_file/search_files to check file contents and "
+    "project structure before making changes. Never guess at file contents.\n"
+    "- **Dependency checks:** Never assume a library is available. Check "
+    "package.json, requirements.txt, Cargo.toml, etc. before importing.\n"
+    "- **Conciseness:** Keep explanatory text brief — a few sentences, not "
+    "paragraphs. Focus on actions and results over narration.\n"
+    "- **Parallel tool calls:** When you need to perform multiple independent "
+    "operations (e.g. reading several files), make all the tool calls in a "
+    "single response rather than sequentially.\n"
+    "- **Non-interactive commands:** Use flags like -y, --yes, --non-interactive "
+    "to prevent CLI tools from hanging on prompts.\n"
+    "- **Keep going:** Work autonomously until the task is fully resolved. "
+    "Don't stop with a plan — execute it.\n"
+)
+
+
+>>>>>>> bd12b3c2321b591d6c924ee9b62b52667a314dd0
 # Guidance injected into the system prompt when the computer_use toolset
 # is active. Hard safety constraints only — no behavioral tips.
 COMPUTER_USE_GUIDANCE = (
@@ -506,7 +633,7 @@ WSL_ENVIRONMENT_HINT = (
 # misleading — the agent should only see the machine it can actually touch.
 _REMOTE_TERMINAL_BACKENDS = frozenset({
     "docker", "singularity", "modal", "daytona", "ssh",
-    "vercel_sandbox", "managed_modal",
+    "managed_modal",
 })
 
 
@@ -520,7 +647,6 @@ _BACKEND_FALLBACK_DESCRIPTIONS: dict[str, str] = {
     "modal": "a Modal sandbox (Linux)",
     "managed_modal": "a managed Modal sandbox (Linux)",
     "daytona": "a Daytona workspace (Linux)",
-    "vercel_sandbox": "a Vercel sandbox (Linux)",
     "ssh": "a remote host reached over SSH (likely Linux)",
 }
 
@@ -634,7 +760,7 @@ def build_environment_hints() -> str:
       and a Windows-only note that `terminal` shells out to bash, not
       PowerShell).
     - For **remote / sandbox** terminal backends (docker, singularity,
-      modal, daytona, ssh, vercel_sandbox): host info is **suppressed**
+      modal, daytona, ssh): host info is **suppressed**
       because the agent's tools can't touch the host — only the backend
       matters. A live probe inside the backend reports its OS, user, $HOME,
       and cwd. Falls back to a static summary if the probe fails.
@@ -664,7 +790,7 @@ def build_environment_hints() -> str:
 
         host_lines.append(f"User home directory: {os.path.expanduser('~')}")
         try:
-            host_lines.append(f"Current working directory: {os.getcwd()}")
+            host_lines.append(f"Current working directory: {resolve_agent_cwd()}")
         except OSError:
             pass
 
@@ -710,6 +836,27 @@ def build_environment_hints() -> str:
 
     if is_wsl():
         hints.append(WSL_ENVIRONMENT_HINT)
+
+    # Embedder-supplied environment description. Lets a host that wraps Hermes
+    # (e.g. a sandbox runner / managed platform) explain the environment the
+    # agent is running in — proxy, credential handling, mount layout — without
+    # forking the identity slot (SOUL.md). Read once at prompt-build time, so
+    # it's part of the stable, cache-safe system prompt. The env var is the
+    # build-time/embedder mechanism (set in a container ENV); config.yaml
+    # ``agent.environment_hint`` is the user-facing surface. Env var wins.
+    extra = (os.getenv("HERMES_ENVIRONMENT_HINT") or "").strip()
+    if not extra:
+        try:
+            from hermes_cli.config import load_config
+
+            extra = str(
+                (load_config().get("agent", {}) or {}).get("environment_hint", "")
+            ).strip()
+        except Exception as e:
+            logger.debug("Could not read agent.environment_hint from config: %s", e)
+    if extra:
+        hints.append(extra)
+
     return "\n\n".join(hints)
 
 
