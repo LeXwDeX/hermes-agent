@@ -66,6 +66,7 @@ Usage:
     content = skill_view("axolotl", "references/dataset-formats.md")
 """
 
+import asyncio
 import json
 import logging
 
@@ -626,11 +627,16 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
 
                 category = _get_category_from_path(skill_md)
 
+                keywords = frontmatter.get("trigger_keywords", [])
+                if isinstance(keywords, str):
+                    keywords = [keywords]
+
                 seen_names.add(name)
                 skills.append({
                     "name": name,
                     "description": description,
                     "category": category,
+                    "trigger_keywords": keywords,
                 })
 
             except (UnicodeDecodeError, PermissionError) as e:
@@ -652,17 +658,19 @@ def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def skills_list(category: str = None, task_id: str = None) -> str:
     """
-    List all available skills (progressive disclosure tier 1 - minimal metadata).
-
-    Returns only name + description to minimize token usage. Use skill_view() to
-    load full content, tags, related files, etc.
+    List available skills, with optional keyword search.
 
     Args:
-        category: Optional category filter (e.g., "mlops")
-        task_id: Optional task identifier used to probe the active backend
+        query: Keyword query for semantic search. When provided, returns ranked
+               matches instead of the full list.
+        category: Optional category filter (only applied in full-list mode when
+                  query is None).
+        limit: Max results to return when query is provided (default 10).
+        task_id: Optional task identifier used to probe the active backend.
 
     Returns:
-        JSON string with minimal skill info: name, description, category
+        JSON string. When query is None: full list with name/description/category.
+        When query is set: ranked results with score and match_on fields.
     """
     try:
         if not SKILLS_DIR.exists():
@@ -677,7 +685,6 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                 ensure_ascii=False,
             )
 
-        # Find all skills
         all_skills = _find_all_skills()
 
         if not all_skills:
@@ -691,24 +698,63 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                 ensure_ascii=False,
             )
 
-        # Filter by category if specified
+        # ── Keyword search mode ──────────────────────────────────────────────
+        if query:
+            q = query.strip()
+            scored = []
+            for s in all_skills:
+                score, match_on = _match_score(
+                    s["name"],
+                    s.get("description", ""),
+                    s.get("trigger_keywords", []),
+                    q,
+                )
+                if score > 0:
+                    scored.append({
+                        "name": s["name"],
+                        "description": s.get("description", ""),
+                        "score": score,
+                        "match_on": match_on,
+                    })
+
+            scored.sort(key=lambda x: x["score"], reverse=True)
+            results = scored[:limit]
+
+            return json.dumps(
+                {
+                    "query": q,
+                    "total_matches": len(scored),
+                    "results": results,
+                    "hint": (
+                        "Use skill_view(name) to load a skill. "
+                        "If no skill matches, the query may need different keywords."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+
+        # ── Full-list mode (query=None, backward-compatible) ─────────────────
         if category:
             all_skills = [s for s in all_skills if s.get("category") == category]
 
-        # Sort by category then name
         all_skills = _sort_skills(all_skills)
 
-        # Extract unique categories
         categories = sorted(
             {s.get("category") for s in all_skills if s.get("category")}
         )
 
+        # Strip internal-only field before returning to callers
+        output_skills = [
+            {"name": s["name"], "description": s["description"], "category": s.get("category")}
+            for s in all_skills
+        ]
+
         return json.dumps(
             {
                 "success": True,
-                "skills": all_skills,
+                "skills": output_skills,
                 "categories": categories,
-                "count": len(all_skills),
+                "count": len(output_skills),
                 "hint": "Use skill_view(name) to see full content, tags, and linked files",
             },
             ensure_ascii=False,
@@ -1419,6 +1465,211 @@ def skill_view(
 
 
 
+# ---------------------------------------------------------------------------
+# skill_search — unified Skill + Memory retrieval
+# ---------------------------------------------------------------------------
+
+def _parse_query(query: str) -> dict:
+    """Split query into term categories (pure code, no LLM)."""
+    terms = [t.strip().lower() for t in query.split() if len(t.strip()) > 1]
+    _ACTION_WORDS = {
+        "配置", "安装", "使用", "部署", "创建", "修改", "查找", "搜索",
+        "config", "install", "use", "deploy", "create", "modify", "find", "search",
+        "setup", "run", "build", "test", "debug", "fix",
+    }
+    action_terms = [t for t in terms if t in _ACTION_WORDS]
+    non_action = [t for t in terms if t not in _ACTION_WORDS]
+    domain_terms = [t for t in non_action if len(t) >= 3][:5]
+    topic_terms = [t for t in non_action if len(t) >= 2 and t not in domain_terms][:3]
+    return {
+        "domain_terms": domain_terms,
+        "topic_terms": topic_terms,
+        "action_terms": action_terms,
+        "all_terms": terms,
+    }
+
+
+def _find_skill_dir(name: str) -> Optional[Path]:
+    """Return the directory for a skill by resolved name."""
+    from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
+
+    dirs_to_scan = []
+    if SKILLS_DIR.exists():
+        dirs_to_scan.append(SKILLS_DIR)
+    dirs_to_scan.extend(get_external_skills_dirs())
+
+    for scan_dir in dirs_to_scan:
+        for skill_md in iter_skill_index_files(scan_dir, "SKILL.md"):
+            if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
+                continue
+            skill_dir = skill_md.parent
+            try:
+                content = skill_md.read_text(encoding="utf-8")[:1000]
+                frontmatter, _ = _parse_frontmatter(content)
+                if frontmatter.get("name", skill_dir.name) == name:
+                    return skill_dir
+            except Exception:
+                continue
+    return None
+
+
+async def _search_skills_pipeline(terms: dict, limit: int) -> list:
+    """Stage 1 (match) → Stage 2 (rank) → Stage 3 (enrich top 3)."""
+    search_query = " ".join(terms["domain_terms"] + terms["topic_terms"])
+
+    # Stage 1: Match
+    all_skills = _find_all_skills()
+    matches = []
+    for s in all_skills:
+        score, match_on = _match_score(
+            s["name"],
+            s.get("description", ""),
+            s.get("trigger_keywords", []),
+            search_query,
+        )
+        if score > 0:
+            matches.append({**s, "score": score, "match_on": match_on})
+
+    # Stage 2: Rank
+    matches.sort(key=lambda x: x["score"], reverse=True)
+    ranked = matches[:limit]
+
+    # Stage 3: Enrich top 3 with a body preview
+    for skill in ranked[:3]:
+        skill_dir = _find_skill_dir(skill["name"])
+        if not skill_dir:
+            continue
+        skill_md = skill_dir / "SKILL.md"
+        if not skill_md.exists():
+            continue
+        try:
+            text = skill_md.read_text(encoding="utf-8")
+            body_start = text.find("\n---\n", text.find("---", 3) + 3)
+            if body_start > 0:
+                skill["preview"] = text[body_start + 5:body_start + 305].strip()[:200]
+        except Exception:
+            pass
+
+    return ranked
+
+
+def _call_hindsight_recall(query: str, limit: int) -> list:
+    """POST to Hindsight recall API; returns [] on any error."""
+    import urllib.request
+
+    url = "http://192.168.33.110:8888/v1/default/banks/hermes-329433061294866433/recall"
+    body = json.dumps({"query": query, "limit": limit}).encode()
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+            memories = data.get("memories", data.get("results", []))
+            return [
+                {"content": m.get("content", "")[:200], "score": m.get("score", 0)}
+                for m in memories[:limit]
+            ]
+    except Exception as e:
+        return [{"error": str(e)}]
+
+
+def _call_session_search(query: str, limit: int) -> list:
+    """FTS5 search against sessions.db; returns [] when DB absent or on error."""
+    import sqlite3
+
+    db_path = Path(get_hermes_home()) / "sessions" / "sessions.db"
+    if not db_path.exists():
+        return []
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cur = conn.execute(
+            "SELECT session_id, title, substr(content, 1, 200) FROM sessions_fts "
+            "WHERE sessions_fts MATCH ? ORDER BY rank LIMIT ?",
+            (query, limit),
+        )
+        return [{"session_id": r[0], "title": r[1], "snippet": r[2]} for r in cur.fetchall()]
+    except Exception:
+        return []
+    finally:
+        conn.close()
+
+
+async def _search_memory_pipeline(query: str, limit: int) -> dict:
+    """Run Hindsight + Session searches in parallel (both are blocking I/O)."""
+    hindsight_result, session_result = await asyncio.gather(
+        asyncio.to_thread(_call_hindsight_recall, query, limit),
+        asyncio.to_thread(_call_session_search, query, limit),
+    )
+    return {"hindsight": hindsight_result, "sessions": session_result}
+
+
+def _merge_results(query: str, skills: list, memories: dict) -> dict:
+    return {
+        "query": query,
+        "skills": {"total": len(skills), "results": skills},
+        "memory": memories,
+        "hint": (
+            "skill_view(name) to load a matched skill. "
+            "hindsight_recall(query) for deep memory search if skill_search results are insufficient."
+        ),
+    }
+
+
+async def _skill_search_async(query: str, limit: int) -> dict:
+    terms = _parse_query(query)
+    skill_results, memory_results = await asyncio.gather(
+        _search_skills_pipeline(terms, limit),
+        _search_memory_pipeline(query, 3),
+    )
+    return _merge_results(query, skill_results, memory_results)
+
+
+def skill_search(query: str, limit: int = 5) -> str:
+    """Unified skill + memory retrieval. Single entry point."""
+    loop = asyncio.new_event_loop()
+    try:
+        result = loop.run_until_complete(_skill_search_async(query, limit))
+    finally:
+        loop.close()
+    return json.dumps(result, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
+# knowledge_recall — declarative knowledge retrieval
+# ---------------------------------------------------------------------------
+
+def knowledge_recall(query: str, limit: int = 5) -> str:
+    """Search declarative knowledge (facts about the environment and systems)."""
+    hindsight_results = _call_hindsight_recall(query, limit)
+    clean = [r for r in hindsight_results if not r.get("error")]
+    try:
+        session_results = _call_session_search(query, 3)
+    except Exception:
+        session_results = []
+    return json.dumps(
+        {
+            "query": query,
+            "knowledge": {
+                "total": len(clean),
+                "results": [
+                    {
+                        "content": r.get("content", ""),
+                        "score": r.get("score", 0),
+                    }
+                    for r in clean
+                ],
+            },
+            "memory": {
+                "sessions": session_results,
+            },
+        },
+        ensure_ascii=False,
+    )
+
+
 if __name__ == "__main__":
     """Test the skills tool"""
     print("🎯 Skills Tool Test")
@@ -1499,6 +1750,14 @@ SKILL_VIEW_SCHEMA = {
         "required": ["name"],
     },
 }
+
+SKILL_VIEW_SCHEMA["description"] += (
+    "\n\nA skill is structured procedural memory — when loaded, it gives you "
+    "domain expertise: proven workflows, known pitfalls, hard constraints, "
+    "environment facts, and error patterns specific to that domain. "
+    "Skills are the 'fat' in Thin Memory, Fat Skills — they carry operational "
+    "knowledge while general memory stays lean."
+)
 
 registry.register(
     name="skills_list",

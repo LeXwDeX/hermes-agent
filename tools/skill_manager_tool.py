@@ -167,6 +167,10 @@ MAX_SKILL_FILE_BYTES = 1_048_576    # 1 MiB per supporting file
 # Characters allowed in skill names (filesystem-safe, URL-friendly)
 VALID_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9._-]*$')
 
+# IP address pattern: rejects names containing numeric octets separated by hyphens
+# e.g. deploy-192-168-1-1 or 33-1-10 (dot-separated IPs like 33.110 are rare in practice)
+IP_PATTERN = re.compile(r'(?:^|-)(?:\d{1,3}-){2,}\d{1,3}')
+
 # Subdirectories allowed for write_file/remove_file
 ALLOWED_SUBDIRS = {"references", "templates", "scripts", "assets"}
 
@@ -181,11 +185,29 @@ def _validate_name(name: str) -> Optional[str]:
         return "Skill name is required."
     if len(name) > MAX_NAME_LENGTH:
         return f"Skill name exceeds {MAX_NAME_LENGTH} characters."
+    # Uppercase check before regex for a clearer error message; prefix preserves
+    # test compatibility ("Invalid skill name 'X'" must appear in the output).
+    if any(c.isupper() for c in name):
+        return (
+            f"Invalid skill name '{name}'. "
+            f"Skill name must be all lowercase. Use hyphens for word separation."
+        )
     if not VALID_NAME_RE.match(name):
         return (
             f"Invalid skill name '{name}'. Use lowercase letters, numbers, "
             f"hyphens, dots, and underscores. Must start with a letter or digit."
         )
+    # IP address detection — names like 'deploy-192-168-1-1' embed host addresses
+    # that will break when the host changes; require a semantic name instead.
+    if IP_PATTERN.search(name):
+        return (
+            "Skill name must not contain IP addresses. "
+            "Use a semantic name (e.g., 'deploy-internal' not 'deploy-192.168.1.1')."
+        )
+    # Segment count: more than 4 hyphen-separated parts make names unwieldy.
+    segments = name.split('-')
+    if len(segments) > 4:
+        return f"Skill name has {len(segments)} segments (max 4). Consider a shorter name."
     return None
 
 
@@ -473,6 +495,43 @@ def _atomic_write_text(file_path: Path, content: str, encoding: str = "utf-8") -
 # Core actions
 # =============================================================================
 
+def _check_domain_overlap(name: str) -> Optional[Dict]:
+    """Check if skills with the same domain prefix already exist.
+
+    Returns a warning dict if overlap found, else None.  Single-segment names
+    (e.g. 'cardputer') have no domain prefix and are skipped.
+    """
+    domain = name.split('-')[0]
+    if domain == name:
+        return None  # single-segment — no domain to check
+
+    from agent.skill_utils import get_all_skills_dirs, EXCLUDED_SKILL_DIRS
+    same_domain = []
+    for skills_dir in get_all_skills_dirs():
+        if not skills_dir.exists():
+            continue
+        for skill_md in skills_dir.rglob("SKILL.md"):
+            if any(part in EXCLUDED_SKILL_DIRS for part in skill_md.parts):
+                continue
+            existing_name = skill_md.parent.name
+            if existing_name.startswith(domain + '-'):
+                same_domain.append(existing_name)
+
+    if same_domain:
+        return {
+            "warning": True,
+            "overlap": True,
+            "domain": domain,
+            "existing_skills": same_domain,
+            "suggestion": (
+                f"Skills in domain '{domain}' already exist: {', '.join(same_domain)}. "
+                f"Use skill_view() to check if one covers your need. "
+                f"Actions: UPDATE (if same topic), CREATE (if different topic), MERGE (if overlapping)."
+            ),
+        }
+    return None
+
+
 def _create_skill(name: str, content: str, category: str = None) -> Dict[str, Any]:
     """Create a new user skill with SKILL.md content."""
     # Validate name
@@ -496,10 +555,13 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
     # Check for name collisions across all directories
     existing = _find_skill(name)
     if existing:
-        return {
-            "success": False,
-            "error": f"A skill named '{name}' already exists at {existing['path']}."
-        }
+        suggestion = (
+            f"Skill '{name}' already exists at {existing['path']}. "
+            f"Decide: UPDATE (skill_manage action='edit'/'patch'), "
+            f"MERGE (combine content then delete with absorbed_into='{name}'), "
+            f"or RENAME (use a different name)."
+        )
+        return {"success": False, "error": suggestion, "existing_path": str(existing['path'])}
 
     # Create the skill directory
     skill_dir = _resolve_skill_dir(name, category)
@@ -527,6 +589,10 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
         "To add reference files, templates, or scripts, use "
         "skill_manage(action='write_file', name='{}', file_path='references/example.md', file_content='...')".format(name)
     )
+    # Domain overlap check — warning only, creation already succeeded.
+    domain_warning = _check_domain_overlap(name)
+    if domain_warning:
+        result["domain_warning"] = domain_warning
     return result
 
 
