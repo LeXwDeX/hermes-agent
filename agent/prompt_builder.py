@@ -410,7 +410,6 @@ GOOGLE_MODEL_OPERATIONAL_GUIDANCE = (
 )
 
 
->>>>>>> bd12b3c2321b591d6c924ee9b62b52667a314dd0
 # Guidance injected into the system prompt when the computer_use toolset
 # is active. Hard safety constraints only — no behavioral tips.
 COMPUTER_USE_GUIDANCE = (
